@@ -1,5 +1,5 @@
 // ====================================================
-// SimpleDraft Backend Server (v3.0 - Deno Deploy Ready)
+// SimpleDraft Backend Server (v3.1 - Deno Deploy Final)
 // ====================================================
 
 import { Hono } from "hono";
@@ -16,8 +16,9 @@ const FRONTEND_URL = Deno.env.get("FRONTEND_URL") || "https://simpledraft.cyruss
 
 // بررسی وجود متغیرهای حیاتی
 if (!JWT_SECRET || !DATABASE_URL) {
-  console.error("FATAL: JWT_SECRET or DATABASE_URL environment variables are not set in Deno Deploy dashboard.");
-  Deno.exit(1);
+  // به جای Deno.exit، یک خطای واضح ایجاد می‌کنیم.
+  // Deno Deploy این خطا را لاگ کرده و اجرای برنامه را متوقف می‌کند.
+  throw new Error("FATAL: JWT_SECRET or DATABASE_URL environment variables are not set in Deno Deploy dashboard.");
 }
 
 // --- راه‌اندازی کلاینت دیتابیس Postgres ---
@@ -47,79 +48,61 @@ async function initializeSchema() {
   console.log("✅ Database schema is ready.");
 }
 
-// --- اتصال به دیتابیس و ساخت schema ---
-try {
+// --- تابع اصلی برای راه‌اندازی و اتصال ---
+async function startServer() {
+  try {
     await client.connect();
     console.log("✅ Successfully connected to PostgreSQL database.");
     await initializeSchema();
-} catch (err) {
+  } catch (err) {
     console.error("❌ Database connection or schema initialization failed:", err);
-    Deno.exit(1); // در صورت عدم اتصال، برنامه متوقف می‌شود
+    // به جای Deno.exit، یک خطا throw می‌کنیم تا Deno Deploy آن را مدیریت کند.
+    throw new Error("Database initialization failed. Check connection string and database status.");
+  }
+
+  // --- راه‌اندازی اپلیکیشن Hono ---
+  const app = new Hono();
+
+  // --- Middlewares ---
+  app.use('*', cors({
+      origin: [FRONTEND_URL, 'http://127.0.0.1:5500'],
+      credentials: true
+  }));
+          if (existingResult.rows.length > 0) {
+              return c.json({ error: 'کاربری با این ایمیل قبلاً ثبت‌نام کرده است.' }, 409);
+          }
+          const passwordHash = await hash(password);
+          const insertResult = await client.queryObject<{ id: number; email: string }>("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email", [email, passwordHash]);
+          const user = insertResult.rows[0];
+          const token = await createToken(user.id, JWT_SECRET);
+          c.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'None', maxAge: 60 * 60 * 24 * 7 });
+          return c.json({ user });
+      } catch (error) {
+          if (error instanceof z.ZodError) return c.json({ error: 'اطلاعات وارد شده معتبر نیست.', details: error.errors }, 400);
+          console.error("Register Error:", error);
+          return c.json({ error: 'ثبت‌نام با خطا مواجه شد.' }, 500);
+      }
+  });
+
+  // --- روت‌های اسناد ---
+  app.get('/api/documents', jwtMiddleware, async (c) => {
+      const payload = c.get('jwtPayload');
+      const result = await client.queryObject(
+          'SELECT id, title, content, raw_content as "rawContent", "lastModified" FROM documents WHERE user_id = $1 ORDER BY "lastModified" DESC',
+          [payload.id]
+      );
+      return c.json({ documents: result.rows });
+  });
+  
+  // ... (تمام روت‌های دیگر شما در اینجا قرار می‌گیرند) ...
+
+
+  // --- شروع به کار سرور ---
+  Deno.serve(app.fetch);
+  console.log("Server is ready and listening.");
 }
 
-// --- تعریف Schema با Zod ---
-const authSchema = z.object({
-    email: z.string().email("ایمیل وارد شده معتبر نیست."),
-    password: z.string().min(6, "رمز عبور باید حداقل ۶ کاراکتر باشد.")
+// اجرای تابع اصلی برنامه
+startServer().catch(err => {
+  console.error("Application failed to start:", err.message);
 });
-
-// --- راه‌اندازی اپلیکیشن Hono ---
-const app = new Hono();
-
-// --- Middlewares ---
-app.use('*', cors({
-    origin: [FRONTEND_URL, 'http://127.0.0.1:5500'], // آدرس‌های معتبر برای CORS
-    credentials: true
-}));
-
-const jwtMiddleware = jwt({ secret: JWT_SECRET, cookie: 'token' });
-
-async function createToken(userId: number, secret: string): Promise<string> {
-  const payload = { id: userId, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7 };
-  return await sign(payload, secret);
-}
-
-// --- Endpoints ---
-
-// مسیر Health Check برای Deno Deploy
-app.get('/health', (c) => c.json({ status: 'ok' }));
-
-app.get('/', (c) => c.json({ status: 'ok', message: 'SimpleDraft API is running on Deno Deploy!' }));
-
-// --- روت‌های احراز هویت ---
-app.post('/api/auth/register', async (c) => {
-    try {
-        const body = await c.req.json();
-        const { email, password } = authSchema.parse(body);
-        const existingResult = await client.queryObject<{ id: number }>("SELECT id FROM users WHERE email = $1", [email]);
-        if (existingResult.rows.length > 0) {
-            return c.json({ error: 'کاربری با این ایمیل قبلاً ثبت‌نام کرده است.' }, 409);
-        }
-        const passwordHash = await hash(password);
-        const insertResult = await client.queryObject<{ id: number; email: string }>("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email", [email, passwordHash]);
-        const user = insertResult.rows[0];
-        const token = await createToken(user.id, JWT_SECRET);
-        c.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'None', maxAge: 60 * 60 * 24 * 7 });
-        return c.json({ user });
-    } catch (error) {
-        if (error instanceof z.ZodError) return c.json({ error: 'اطلاعات وارد شده معتبر نیست.', details: error.errors }, 400);
-        console.error("Register Error:", error);
-        return c.json({ error: 'ثبت‌نام با خطا مواجه شد.' }, 500);
-    }
-});
-
-// --- روت‌های اسناد ---
-app.get('/api/documents', jwtMiddleware, async (c) => {
-    const payload = c.get('jwtPayload');
-    const result = await client.queryObject(
-        'SELECT id, title, content, raw_content as "rawContent", "lastModified" FROM documents WHERE user_id = $1 ORDER BY "lastModified" DESC',
-        [payload.id]
-    );
-    return c.json({ documents: result.rows });
-});
-
-// ... (تمام روت‌های دیگر شما در اینجا قرار می‌گیرند) ...
-
-// --- شروع به کار سرور ---
-// Deno.serve به طور خودکار روی پورت مناسب در Deno Deploy اجرا می‌شود
-Deno.serve(app.fetch);
