@@ -1,13 +1,12 @@
 // ====================================================
-// SimpleDraft Backend Server (v4.0 - Complete API)
-// Production-ready Deno 2.x server with full CRUD operations
+// SimpleDraft Backend Server (v4.1 - Fixed Authentication)
+// Production-ready Deno 2.x server with Web Crypto API
 // ====================================================
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { jwt, sign, verify } from "hono/jwt";
 import { Client } from "postgres";
-import { hash, compare } from "bcrypt";
 import { z } from "zod";
 
 // --- Environment Configuration ---
@@ -24,6 +23,115 @@ if (!JWT_SECRET || !DATABASE_URL) {
 
 // --- Database Client Setup ---
 const client = new Client(DATABASE_URL);
+
+// --- Password Hashing with Web Crypto API ---
+class PasswordCrypto {
+  private static readonly ITERATIONS = 100000;
+  private static readonly KEY_LENGTH = 64;
+  private static readonly SALT_LENGTH = 16;
+
+  /**
+   * Hash password using PBKDF2 with Web Crypto API
+   */
+  static async hash(password: string): Promise<string> {
+    try {
+      // Generate random salt
+      const salt = crypto.getRandomValues(new Uint8Array(this.SALT_LENGTH));
+      
+      // Convert password to buffer
+      const passwordBuffer = new TextEncoder().encode(password);
+      
+      // Import password as key material
+      const keyMaterial = await crypto.subtle.importKey(
+        "raw",
+        passwordBuffer,
+        "PBKDF2",
+        false,
+        ["deriveBits"]
+      );
+      
+      // Derive key using PBKDF2
+      const derivedKey = await crypto.subtle.deriveBits(
+        {
+          name: "PBKDF2",
+          salt: salt,
+          iterations: this.ITERATIONS,
+          hash: "SHA-256"
+        },
+        keyMaterial,
+        this.KEY_LENGTH * 8
+      );
+      
+      // Combine salt and derived key
+      const hashArray = new Uint8Array(this.SALT_LENGTH + this.KEY_LENGTH);
+      hashArray.set(salt, 0);
+      hashArray.set(new Uint8Array(derivedKey), this.SALT_LENGTH);
+      
+      // Convert to base64
+      return btoa(String.fromCharCode(...hashArray));
+    } catch (error) {
+      console.error("Password hashing failed:", error);
+      throw new Error("Password hashing failed");
+    }
+  }
+
+  /**
+   * Verify password against stored hash
+   */
+  static async verify(password: string, storedHash: string): Promise<boolean> {
+    try {
+      // Decode the stored hash
+      const hashArray = new Uint8Array(
+        atob(storedHash).split('').map(char => char.charCodeAt(0))
+      );
+      
+      // Extract salt and stored key
+      const salt = hashArray.slice(0, this.SALT_LENGTH);
+      const storedKey = hashArray.slice(this.SALT_LENGTH);
+      
+      // Convert password to buffer
+      const passwordBuffer = new TextEncoder().encode(password);
+      
+      // Import password as key material
+      const keyMaterial = await crypto.subtle.importKey(
+        "raw",
+        passwordBuffer,
+        "PBKDF2",
+        false,
+        ["deriveBits"]
+      );
+      
+      // Derive key with same parameters
+      const derivedKey = await crypto.subtle.deriveBits(
+        {
+          name: "PBKDF2",
+          salt: salt,
+          iterations: this.ITERATIONS,
+          hash: "SHA-256"
+        },
+        keyMaterial,
+        this.KEY_LENGTH * 8
+      );
+      
+      // Compare keys using constant-time comparison
+      const derivedKeyArray = new Uint8Array(derivedKey);
+      
+      if (derivedKeyArray.length !== storedKey.length) {
+        return false;
+      }
+      
+      let result = 0;
+      for (let i = 0; i < derivedKeyArray.length; i++) {
+        result |= derivedKeyArray[i] ^ storedKey[i];
+      }
+      
+      return result === 0;
+    } catch (error) {
+      console.error("Password verification failed:", error);
+      return false;
+    }
+  }
+}
 
 // --- Validation Schemas ---
 const authSchema = z.object({
@@ -164,15 +272,17 @@ async function startServer() {
     app.get('/health', (c) => c.json({ 
       status: 'healthy', 
       timestamp: new Date().toISOString(),
-      version: '4.0'
+      version: '4.1',
+      crypto: 'Web Crypto API'
     }));
 
     app.get('/', (c) => c.json({ 
-      message: 'SimpleDraft API v4.0 - Full CRUD Operations',
+      message: 'SimpleDraft API v4.1 - Web Crypto Authentication',
       endpoints: {
         auth: ['/api/auth/register', '/api/auth/login', '/api/auth/logout'],
         documents: ['/api/documents (GET/POST)', '/api/documents/:id (PUT/DELETE)']
-      }
+      },
+      security: 'PBKDF2 with SHA-256'
     }));
 
     // === AUTHENTICATION ROUTES ===
@@ -181,6 +291,8 @@ async function startServer() {
     app.post('/api/auth/register', async (c) => {
       try {
         const body = await c.req.json();
+        console.log("📝 Registration attempt for:", body.email);
+        
         const { email, password } = authSchema.parse(body);
 
         // Check if user already exists
@@ -190,17 +302,25 @@ async function startServer() {
         );
 
         if (existingResult.rows.length > 0) {
+          console.log("❌ User already exists:", email);
           return c.json({ error: "User with this email already exists" }, 409);
         }
 
-        // Hash password and create user
-        const passwordHash = await hash(password);
+        // Hash password using Web Crypto API
+        console.log("🔐 Hashing password...");
+        const passwordHash = await PasswordCrypto.hash(password);
+        
+        // Create user
+        console.log("👤 Creating user in database...");
         const insertResult = await client.queryObject<{ id: number; email: string; created_at: string }>(
           "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at",
           [email.toLowerCase(), passwordHash]
         );
 
         const user = insertResult.rows[0];
+        console.log("✅ User created with ID:", user.id);
+        
+        // Generate JWT
         const token = await generateJWT(user.id);
 
         // Set HTTP-only cookie
@@ -217,14 +337,18 @@ async function startServer() {
 
       } catch (error) {
         if (error instanceof z.ZodError) {
+          console.log("❌ Validation error:", error.errors);
           return c.json({ 
             error: "Invalid input data", 
             details: error.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
           }, 400);
         }
         
-        console.error("Registration error:", error);
-        return c.json({ error: "Registration failed" }, 500);
+        console.error("❌ Registration error:", error);
+        return c.json({ 
+          error: "Registration failed", 
+          details: error.message 
+        }, 500);
       }
     });
 
@@ -232,9 +356,12 @@ async function startServer() {
     app.post('/api/auth/login', async (c) => {
       try {
         const body = await c.req.json();
+        console.log("🔐 Login attempt for:", body.email);
+        
         const { email, password } = authSchema.parse(body);
 
         // Find user by email
+        console.log("👤 Finding user in database...");
         const userResult = await client.queryObject<{ 
           id: number; 
           email: string; 
@@ -246,16 +373,23 @@ async function startServer() {
         );
 
         if (userResult.rows.length === 0) {
+          console.log("❌ User not found:", email);
           return c.json({ error: "Invalid email or password" }, 401);
         }
 
         const user = userResult.rows[0];
+        console.log("✅ User found with ID:", user.id);
 
-        // Verify password
-        const passwordValid = await compare(password, user.password_hash);
+        // Verify password using Web Crypto API
+        console.log("🔐 Verifying password...");
+        const passwordValid = await PasswordCrypto.verify(password, user.password_hash);
+        
         if (!passwordValid) {
+          console.log("❌ Invalid password for:", email);
           return c.json({ error: "Invalid email or password" }, 401);
         }
+
+        console.log("✅ Password verified successfully");
 
         // Generate JWT and set cookie
         const token = await generateJWT(user.id);
@@ -272,14 +406,18 @@ async function startServer() {
 
       } catch (error) {
         if (error instanceof z.ZodError) {
+          console.log("❌ Validation error:", error.errors);
           return c.json({ 
             error: "Invalid input data", 
             details: error.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
           }, 400);
         }
         
-        console.error("Login error:", error);
-        return c.json({ error: "Login failed" }, 500);
+        console.error("❌ Login error:", error);
+        return c.json({ 
+          error: "Login failed", 
+          details: error.message 
+        }, 500);
       }
     });
 
@@ -482,9 +620,9 @@ async function startServer() {
     });
 
     // === SERVER STARTUP ===
-    console.log(`🚀 SimpleDraft API v4.0 starting on port ${PORT}`);
+    console.log(`🚀 SimpleDraft API v4.1 starting on port ${PORT}`);
     console.log(`📄 Swagger/docs available at: ${FRONTEND_URL}`);
-    console.log(`🔐 JWT Secret: ${JWT_SECRET ? '✅ Configured' : '❌ Missing'}`);
+    console.log(`🔐 Authentication: Web Crypto API (PBKDF2)`);
     console.log(`💾 Database: ${DATABASE_URL ? '✅ Connected' : '❌ Not connected'}`);
 
     Deno.serve({ port: PORT }, app.fetch);
