@@ -1,6 +1,6 @@
 // ====================================================
-// SimpleDraft API - Oak Framework Version
-// Stable, Express-like, Production Ready
+// SimpleDraft API - Oak Framework (Fixed Database)
+// Migration-safe, Deno Deploy Compatible
 // ====================================================
 
 import { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
@@ -16,7 +16,7 @@ const FRONTEND_URL = Deno.env.get("FRONTEND_URL") || "https://simpledraft.cyruss
 
 if (!DATABASE_URL) {
   console.error("❌ DATABASE_URL is required");
-  Deno.exit(1);
+  throw new Error("DATABASE_URL is required");
 }
 
 // === PASSWORD CRYPTO ===
@@ -26,21 +26,17 @@ class SimplePasswordCrypto {
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const passwordData = encoder.encode(password);
     
-    // Combine password + salt
     const combined = new Uint8Array(passwordData.length + salt.length);
     combined.set(passwordData);
     combined.set(salt, passwordData.length);
     
-    // Hash with SHA-256
     const hashBuffer = await crypto.subtle.digest("SHA-256", combined);
     const hashArray = new Uint8Array(hashBuffer);
     
-    // Combine salt + hash for storage
     const result = new Uint8Array(salt.length + hashArray.length);
     result.set(salt);
     result.set(hashArray, salt.length);
     
-    // Convert to base64
     return btoa(String.fromCharCode(...result));
   }
   
@@ -49,11 +45,9 @@ class SimplePasswordCrypto {
       const encoder = new TextEncoder();
       const stored = Uint8Array.from(atob(storedHash), c => c.charCodeAt(0));
       
-      // Extract salt (first 16 bytes) and hash (rest)
       const salt = stored.slice(0, 16);
       const originalHash = stored.slice(16);
       
-      // Hash the provided password with same salt
       const passwordData = encoder.encode(password);
       const combined = new Uint8Array(passwordData.length + salt.length);
       combined.set(passwordData);
@@ -62,7 +56,6 @@ class SimplePasswordCrypto {
       const newHashBuffer = await crypto.subtle.digest("SHA-256", combined);
       const newHash = new Uint8Array(newHashBuffer);
       
-      // Compare hashes
       if (newHash.length !== originalHash.length) return false;
       
       let result = 0;
@@ -80,38 +73,92 @@ class SimplePasswordCrypto {
 // === DATABASE ===
 const client = new Client(DATABASE_URL);
 
+async function safeQuery(sql: string, description: string, params: any[] = []) {
+  try {
+    await client.queryObject(sql, params);
+    console.log(`✅ ${description}`);
+  } catch (error) {
+    // Ignore "already exists" errors
+    if (error.message.includes("already exists") || error.message.includes("duplicate")) {
+      console.log(`⚠️ ${description} (already exists)`);
+    } else {
+      console.error(`❌ ${description}:`, error.message);
+      throw error;
+    }
+  }
+}
+
+async function columnExists(table: string, column: string): Promise<boolean> {
+  try {
+    const result = await client.queryObject(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = $1 AND column_name = $2
+    `, [table, column]);
+    return result.rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function initDatabase() {
   try {
     await client.connect();
     console.log("✅ Connected to PostgreSQL");
     
-    // Create tables
-    await client.queryObject(`
+    // Create users table
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+      )
+    `, "Users table created");
     
-    await client.queryObject(`
+    // Create documents table (basic version)
+    await safeQuery(`
       CREATE TABLE IF NOT EXISTS documents (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         title TEXT NOT NULL DEFAULT 'Untitled Document',
         content TEXT DEFAULT '',
-        raw_content TEXT DEFAULT '',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      )
+    `, "Documents table created");
     
-    // Indexes
-    await client.queryObject(`
-      CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
-      CREATE INDEX IF NOT EXISTS idx_documents_updated_at ON documents(updated_at DESC);
-    `);
+    // Add missing columns if they don't exist
+    if (!(await columnExists('documents', 'raw_content'))) {
+      await safeQuery(`
+        ALTER TABLE documents ADD COLUMN raw_content TEXT DEFAULT ''
+      `, "Added raw_content column");
+    }
+    
+    if (!(await columnExists('documents', 'updated_at'))) {
+      await safeQuery(`
+        ALTER TABLE documents ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      `, "Added updated_at column");
+    }
+    
+    // Create indexes (only if columns exist)
+    if (await columnExists('documents', 'user_id')) {
+      await safeQuery(`
+        CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id)
+      `, "User ID index created");
+    }
+    
+    if (await columnExists('documents', 'updated_at')) {
+      await safeQuery(`
+        CREATE INDEX IF NOT EXISTS idx_documents_updated_at ON documents(updated_at DESC)
+      `, "Updated at index created");
+    }
+    
+    // Update existing documents without updated_at
+    await safeQuery(`
+      UPDATE documents 
+      SET updated_at = created_at 
+      WHERE updated_at IS NULL
+    `, "Updated null updated_at values");
     
     console.log("✅ Database schema ready");
   } catch (error) {
@@ -134,7 +181,7 @@ async function createJWT(userId: number, email: string): Promise<string> {
     sub: userId.toString(),
     email: email,
     iat: getNumericDate(new Date()),
-    exp: getNumericDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)) // 7 days
+    exp: getNumericDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000))
   };
   
   return await create({ alg: "HS256", typ: "JWT" }, payload, JWT_KEY);
@@ -159,12 +206,9 @@ async function authMiddleware(context: any, next: () => Promise<unknown>) {
   
   let token: string | null = null;
   
-  // Try to get token from Authorization header
   if (authHeader?.startsWith("Bearer ")) {
     token = authHeader.substring(7);
-  }
-  // Try to get token from cookie
-  else if (cookieHeader) {
+  } else if (cookieHeader) {
     const cookies = cookieHeader.split(';').map(c => c.trim());
     const tokenCookie = cookies.find(c => c.startsWith('token='));
     if (tokenCookie) {
@@ -187,7 +231,6 @@ async function authMiddleware(context: any, next: () => Promise<unknown>) {
     return;
   }
   
-  // Verify user still exists
   const userResult = await client.queryObject(
     "SELECT id, email FROM users WHERE id = $1",
     [payload.userId]
@@ -200,7 +243,6 @@ async function authMiddleware(context: any, next: () => Promise<unknown>) {
     return;
   }
   
-  // Attach user to context
   context.state.user = userResult.rows[0];
   console.log("✅ User authenticated:", payload.email);
   
@@ -213,8 +255,8 @@ const router = new Router();
 // Health check
 router.get("/", (context) => {
   context.response.body = {
-    message: "SimpleDraft API - Oak Framework",
-    version: "1.0",
+    message: "SimpleDraft API - Oak Framework (Migration Safe)",
+    version: "1.1",
     framework: "Oak",
     timestamp: new Date().toISOString()
   };
@@ -240,7 +282,6 @@ router.post("/api/auth/register", async (context) => {
       return;
     }
     
-    // Check if user exists
     const existingUser = await client.queryObject(
       "SELECT id FROM users WHERE email = $1",
       [email.toLowerCase()]
@@ -253,10 +294,8 @@ router.post("/api/auth/register", async (context) => {
       return;
     }
     
-    // Hash password
     const passwordHash = await SimplePasswordCrypto.hash(password);
     
-    // Create user
     const result = await client.queryObject(
       "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at",
       [email.toLowerCase(), passwordHash]
@@ -265,10 +304,8 @@ router.post("/api/auth/register", async (context) => {
     const user = result.rows[0] as any;
     console.log("✅ User created:", user.email);
     
-    // Create JWT
     const token = await createJWT(user.id, user.email);
     
-    // Set cookie
     context.response.headers.set(
       "Set-Cookie", 
       `token=${token}; HttpOnly; Secure; SameSite=None; Max-Age=${7 * 24 * 60 * 60}; Path=/`
@@ -300,7 +337,6 @@ router.post("/api/auth/login", async (context) => {
       return;
     }
     
-    // Find user
     const result = await client.queryObject(
       "SELECT id, email, password_hash, created_at FROM users WHERE email = $1",
       [email.toLowerCase()]
@@ -315,7 +351,6 @@ router.post("/api/auth/login", async (context) => {
     
     const user = result.rows[0] as any;
     
-    // Verify password
     const validPassword = await SimplePasswordCrypto.verify(password, user.password_hash);
     
     if (!validPassword) {
@@ -325,10 +360,8 @@ router.post("/api/auth/login", async (context) => {
       return;
     }
     
-    // Create JWT
     const token = await createJWT(user.id, user.email);
     
-    // Set cookie
     context.response.headers.set(
       "Set-Cookie", 
       `token=${token}; HttpOnly; Secure; SameSite=None; Max-Age=${7 * 24 * 60 * 60}; Path=/`
@@ -365,21 +398,29 @@ router.get("/api/documents", authMiddleware, async (context) => {
     const user = context.state.user;
     console.log("🔵 Fetching documents for user:", user.email);
     
-    const result = await client.queryObject(
-      `SELECT id, title, content, raw_content, created_at, updated_at 
-       FROM documents 
-       WHERE user_id = $1 
-       ORDER BY updated_at DESC`,
-      [user.id]
-    );
+    // Check if updated_at column exists
+    const hasUpdatedAt = await columnExists('documents', 'updated_at');
+    const hasRawContent = await columnExists('documents', 'raw_content');
+    
+    let query = `SELECT id, title, content, created_at`;
+    if (hasRawContent) query += `, raw_content`;
+    if (hasUpdatedAt) query += `, updated_at`;
+    query += ` FROM documents WHERE user_id = $1`;
+    if (hasUpdatedAt) {
+      query += ` ORDER BY updated_at DESC`;
+    } else {
+      query += ` ORDER BY created_at DESC`;
+    }
+    
+    const result = await client.queryObject(query, [user.id]);
     
     const documents = result.rows.map((row: any) => ({
       id: row.id,
       title: row.title,
       content: row.content,
-      rawContent: row.raw_content,
+      rawContent: hasRawContent ? row.raw_content : '',
       createdAt: row.created_at,
-      lastModified: row.updated_at
+      lastModified: hasUpdatedAt ? row.updated_at : row.created_at
     }));
     
     console.log(`✅ Found ${documents.length} documents`);
@@ -406,12 +447,31 @@ router.post("/api/documents", authMiddleware, async (context) => {
     const content = body.content || "";
     const rawContent = body.rawContent || "";
     
-    const result = await client.queryObject(
-      `INSERT INTO documents (user_id, title, content, raw_content, updated_at) 
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) 
-       RETURNING id, title, content, raw_content, created_at, updated_at`,
-      [user.id, title, content, rawContent]
-    );
+    // Check which columns exist
+    const hasUpdatedAt = await columnExists('documents', 'updated_at');
+    const hasRawContent = await columnExists('documents', 'raw_content');
+    
+    let query = `INSERT INTO documents (user_id, title, content`;
+    let values = `($1, $2, $3`;
+    const params = [user.id, title, content];
+    let paramCount = 3;
+    
+    if (hasRawContent) {
+      query += `, raw_content`;
+      values += `, $${++paramCount}`;
+      params.push(rawContent);
+    }
+    
+    if (hasUpdatedAt) {
+      query += `, updated_at`;
+      values += `, CURRENT_TIMESTAMP`;
+    }
+    
+    query += `) VALUES ${values}) RETURNING id, title, content, created_at`;
+    if (hasRawContent) query += `, raw_content`;
+    if (hasUpdatedAt) query += `, updated_at`;
+    
+    const result = await client.queryObject(query, params);
     
     const document = result.rows[0] as any;
     
@@ -423,9 +483,9 @@ router.post("/api/documents", authMiddleware, async (context) => {
         id: document.id,
         title: document.title,
         content: document.content,
-        rawContent: document.raw_content,
+        rawContent: hasRawContent ? document.raw_content : rawContent,
         createdAt: document.created_at,
-        lastModified: document.updated_at
+        lastModified: hasUpdatedAt ? document.updated_at : document.created_at
       },
       message: "Document created successfully"
     };
@@ -452,13 +512,31 @@ router.put("/api/documents/:id", authMiddleware, async (context) => {
       return;
     }
     
-    const result = await client.queryObject(
-      `UPDATE documents 
-       SET title = $1, content = $2, raw_content = $3, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $4 AND user_id = $5
-       RETURNING id, title, content, raw_content, updated_at`,
-      [body.title, body.content, body.rawContent, documentId, user.id]
-    );
+    // Check which columns exist
+    const hasUpdatedAt = await columnExists('documents', 'updated_at');
+    const hasRawContent = await columnExists('documents', 'raw_content');
+    
+    let query = `UPDATE documents SET title = $1, content = $2`;
+    const params = [body.title, body.content];
+    let paramCount = 2;
+    
+    if (hasRawContent) {
+      query += `, raw_content = $${++paramCount}`;
+      params.push(body.rawContent);
+    }
+    
+    if (hasUpdatedAt) {
+      query += `, updated_at = CURRENT_TIMESTAMP`;
+    }
+    
+    query += ` WHERE id = $${++paramCount} AND user_id = $${++paramCount}`;
+    params.push(documentId, user.id);
+    
+    query += ` RETURNING id, title, content, created_at`;
+    if (hasRawContent) query += `, raw_content`;
+    if (hasUpdatedAt) query += `, updated_at`;
+    
+    const result = await client.queryObject(query, params);
     
     if (result.rows.length === 0) {
       context.response.status = 404;
@@ -475,8 +553,8 @@ router.put("/api/documents/:id", authMiddleware, async (context) => {
         id: document.id,
         title: document.title,
         content: document.content,
-        rawContent: document.raw_content,
-        lastModified: document.updated_at
+        rawContent: hasRawContent ? document.raw_content : body.rawContent,
+        lastModified: hasUpdatedAt ? document.updated_at : document.created_at
       },
       message: "Document updated successfully"
     };
@@ -563,31 +641,16 @@ async function startServer() {
     console.log(`🚀 SimpleDraft API (Oak Framework) starting...`);
     console.log(`📄 Frontend: ${FRONTEND_URL}`);
     console.log(`🔐 JWT Authentication: ✅ Enabled`);
-    console.log(`💾 Database: ✅ Connected`);
+    console.log(`💾 Database: ✅ Connected & Migrated`);
     console.log(`🌐 Port: ${PORT}`);
     
     await app.listen({ port: PORT });
     
   } catch (error) {
     console.error("❌ Server startup failed:", error);
-    Deno.exit(1);
+    throw error; // Don't use Deno.exit() in Deno Deploy
   }
 }
-
-// Graceful shutdown
-const gracefulShutdown = async () => {
-  console.log("\n⏳ Gracefully shutting down...");
-  try {
-    await client.end();
-    console.log("✅ Database connection closed");
-  } catch (error) {
-    console.error("❌ Error during shutdown:", error);
-  }
-  Deno.exit(0);
-};
-
-Deno.addSignalListener("SIGINT", gracefulShutdown);
-Deno.addSignalListener("SIGTERM", gracefulShutdown);
 
 // === START APPLICATION ===
 if (import.meta.main) {
