@@ -1,152 +1,100 @@
 // ====================================================
-// SimpleDraft Backend Server (v4.2 - Fixed Document Creation)
-// Production-ready Deno 2.x server with fixed CRUD operations
+// SimpleDraft API - Oak Framework Version
+// Stable, Express-like, Production Ready
 // ====================================================
 
-import { Hono } from "hono";
-import { cors } from "hono/cors";
-import { jwt, sign, verify } from "hono/jwt";
-import { Client } from "postgres";
-import { z } from "zod";
+import { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
+import { oakCors } from "https://deno.land/x/cors@v1.2.2/mod.ts";
+import { create, verify, getNumericDate } from "https://deno.land/x/djwt@v3.0.1/mod.ts";
+import { Client } from "https://deno.land/x/postgres@v0.17.0/mod.ts";
 
-// --- Environment Configuration ---
-const JWT_SECRET = Deno.env.get("JWT_SECRET");
+// === CONFIGURATION ===
+const JWT_SECRET = Deno.env.get("JWT_SECRET") || "your-super-secret-jwt-key-change-this";
 const DATABASE_URL = Deno.env.get("DATABASE_URL");
-const FRONTEND_URL = Deno.env.get("FRONTEND_URL") || "https://simpledraft.cyrusstudio.ir";
 const PORT = parseInt(Deno.env.get("PORT") || "8000");
+const FRONTEND_URL = Deno.env.get("FRONTEND_URL") || "https://simpledraft.cyrusstudio.ir";
 
-// Critical environment validation
-if (!JWT_SECRET || !DATABASE_URL) {
-  console.error("❌ FATAL: Missing required environment variables (JWT_SECRET, DATABASE_URL)");
+if (!DATABASE_URL) {
+  console.error("❌ DATABASE_URL is required");
   Deno.exit(1);
 }
 
-// --- Database Client Setup ---
-const client = new Client(DATABASE_URL);
-
-// --- Password Hashing with Web Crypto API ---
-class PasswordCrypto {
-  private static readonly ITERATIONS = 100000;
-  private static readonly KEY_LENGTH = 64;
-  private static readonly SALT_LENGTH = 16;
-
+// === PASSWORD CRYPTO ===
+class SimplePasswordCrypto {
   static async hash(password: string): Promise<string> {
-    try {
-      const salt = crypto.getRandomValues(new Uint8Array(this.SALT_LENGTH));
-      const passwordBuffer = new TextEncoder().encode(password);
-      
-      const keyMaterial = await crypto.subtle.importKey(
-        "raw",
-        passwordBuffer,
-        "PBKDF2",
-        false,
-        ["deriveBits"]
-      );
-      
-      const derivedKey = await crypto.subtle.deriveBits(
-        {
-          name: "PBKDF2",
-          salt: salt,
-          iterations: this.ITERATIONS,
-          hash: "SHA-256"
-        },
-        keyMaterial,
-        this.KEY_LENGTH * 8
-      );
-      
-      const hashArray = new Uint8Array(this.SALT_LENGTH + this.KEY_LENGTH);
-      hashArray.set(salt, 0);
-      hashArray.set(new Uint8Array(derivedKey), this.SALT_LENGTH);
-      
-      return btoa(String.fromCharCode(...hashArray));
-    } catch (error) {
-      console.error("Password hashing failed:", error);
-      throw new Error("Password hashing failed");
-    }
+    const encoder = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const passwordData = encoder.encode(password);
+    
+    // Combine password + salt
+    const combined = new Uint8Array(passwordData.length + salt.length);
+    combined.set(passwordData);
+    combined.set(salt, passwordData.length);
+    
+    // Hash with SHA-256
+    const hashBuffer = await crypto.subtle.digest("SHA-256", combined);
+    const hashArray = new Uint8Array(hashBuffer);
+    
+    // Combine salt + hash for storage
+    const result = new Uint8Array(salt.length + hashArray.length);
+    result.set(salt);
+    result.set(hashArray, salt.length);
+    
+    // Convert to base64
+    return btoa(String.fromCharCode(...result));
   }
-
+  
   static async verify(password: string, storedHash: string): Promise<boolean> {
     try {
-      const hashArray = new Uint8Array(
-        atob(storedHash).split('').map(char => char.charCodeAt(0))
-      );
+      const encoder = new TextEncoder();
+      const stored = Uint8Array.from(atob(storedHash), c => c.charCodeAt(0));
       
-      const salt = hashArray.slice(0, this.SALT_LENGTH);
-      const storedKey = hashArray.slice(this.SALT_LENGTH);
-      const passwordBuffer = new TextEncoder().encode(password);
+      // Extract salt (first 16 bytes) and hash (rest)
+      const salt = stored.slice(0, 16);
+      const originalHash = stored.slice(16);
       
-      const keyMaterial = await crypto.subtle.importKey(
-        "raw",
-        passwordBuffer,
-        "PBKDF2",
-        false,
-        ["deriveBits"]
-      );
+      // Hash the provided password with same salt
+      const passwordData = encoder.encode(password);
+      const combined = new Uint8Array(passwordData.length + salt.length);
+      combined.set(passwordData);
+      combined.set(salt, passwordData.length);
       
-      const derivedKey = await crypto.subtle.deriveBits(
-        {
-          name: "PBKDF2",
-          salt: salt,
-          iterations: this.ITERATIONS,
-          hash: "SHA-256"
-        },
-        keyMaterial,
-        this.KEY_LENGTH * 8
-      );
+      const newHashBuffer = await crypto.subtle.digest("SHA-256", combined);
+      const newHash = new Uint8Array(newHashBuffer);
       
-      const derivedKeyArray = new Uint8Array(derivedKey);
-      
-      if (derivedKeyArray.length !== storedKey.length) {
-        return false;
-      }
+      // Compare hashes
+      if (newHash.length !== originalHash.length) return false;
       
       let result = 0;
-      for (let i = 0; i < derivedKeyArray.length; i++) {
-        result |= derivedKeyArray[i] ^ storedKey[i];
+      for (let i = 0; i < newHash.length; i++) {
+        result |= newHash[i] ^ originalHash[i];
       }
       
       return result === 0;
-    } catch (error) {
-      console.error("Password verification failed:", error);
+    } catch {
       return false;
     }
   }
 }
 
-// --- Validation Schemas ---
-const authSchema = z.object({
-  email: z.string().email("Invalid email format").max(255),
-  password: z.string().min(6, "Password must be at least 6 characters").max(128)
-});
+// === DATABASE ===
+const client = new Client(DATABASE_URL);
 
-// اصلاح schema برای documents
-const documentSchema = z.object({
-  title: z.string().min(1, "Title is required").max(255).default("Untitled Document"),
-  content: z.string().optional().default(""),
-  rawContent: z.string().optional().default("")
-});
-
-const documentUpdateSchema = z.object({
-  title: z.string().min(1, "Title is required").max(255),
-  content: z.string().optional().default(""),
-  rawContent: z.string().optional().default("")
-});
-
-// --- Database Schema Initialization ---
-async function initializeDatabase() {
+async function initDatabase() {
   try {
-    // Users table
+    await client.connect();
+    console.log("✅ Connected to PostgreSQL");
+    
+    // Create tables
     await client.queryObject(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
-
-    // Documents table  
+    
     await client.queryObject(`
       CREATE TABLE IF NOT EXISTS documents (
         id SERIAL PRIMARY KEY,
@@ -154,505 +102,471 @@ async function initializeDatabase() {
         title TEXT NOT NULL DEFAULT 'Untitled Document',
         content TEXT DEFAULT '',
         raw_content TEXT DEFAULT '',
-        "lastModified" TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
-
-    // Indexes for performance
+    
+    // Indexes
     await client.queryObject(`
       CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
-      CREATE INDEX IF NOT EXISTS idx_documents_last_modified ON documents("lastModified" DESC);
-      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+      CREATE INDEX IF NOT EXISTS idx_documents_updated_at ON documents(updated_at DESC);
     `);
-
-    console.log("✅ Database schema initialized successfully");
+    
+    console.log("✅ Database schema ready");
   } catch (error) {
-    console.error("❌ Database schema initialization failed:", error);
+    console.error("❌ Database initialization failed:", error);
     throw error;
   }
 }
 
-// --- Utility Functions ---
-async function generateJWT(userId: number): Promise<string> {
+// === JWT HELPERS ===
+const JWT_KEY = await crypto.subtle.importKey(
+  "raw",
+  new TextEncoder().encode(JWT_SECRET),
+  { name: "HMAC", hash: "SHA-256" },
+  false,
+  ["sign", "verify"]
+);
+
+async function createJWT(userId: number, email: string): Promise<string> {
   const payload = {
-    id: userId,
-    exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7)
+    sub: userId.toString(),
+    email: email,
+    iat: getNumericDate(new Date()),
+    exp: getNumericDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)) // 7 days
   };
-  return await sign(payload, JWT_SECRET!);
+  
+  return await create({ alg: "HS256", typ: "JWT" }, payload, JWT_KEY);
 }
 
-async function verifyJWT(token: string): Promise<{ id: number } | null> {
+async function verifyJWT(token: string): Promise<{ userId: number; email: string } | null> {
   try {
-    const payload = await verify(token, JWT_SECRET!) as { id: number };
-    return payload;
+    const payload = await verify(token, JWT_KEY) as any;
+    return {
+      userId: parseInt(payload.sub),
+      email: payload.email
+    };
   } catch {
     return null;
   }
 }
 
-function setCookieHeader(token: string) {
-  return `token=${token}; HttpOnly; Secure; SameSite=None; Max-Age=${60 * 60 * 24 * 7}; Path=/`;
-}
-
-function clearCookieHeader() {
-  return "token=; HttpOnly; Secure; SameSite=None; Max-Age=0; Path=/";
-}
-
-// --- Authentication Middleware ---
-async function authMiddleware(c: any, next: () => Promise<void>) {
-  try {
-    const token = c.req.header("cookie")?.match(/token=([^;]+)/)?.[1];
-    
-    if (!token) {
-      console.log("❌ No token found in cookies");
-      return c.json({ error: "Authentication required" }, 401);
-    }
-
-    const payload = await verifyJWT(token);
-    if (!payload) {
-      console.log("❌ Invalid JWT token");
-      return c.json({ error: "Invalid or expired token" }, 401);
-    }
-
-    const userResult = await client.queryObject<{ id: number; email: string }>(
-      "SELECT id, email FROM users WHERE id = $1",
-      [payload.id]
-    );
-
-    if (userResult.rows.length === 0) {
-      console.log("❌ User not found for ID:", payload.id);
-      return c.json({ error: "User not found" }, 401);
-    }
-
-    console.log("✅ User authenticated:", userResult.rows[0].email);
-    c.set("user", userResult.rows[0]);
-    await next();
-  } catch (error) {
-    console.error("❌ Auth middleware error:", error);
-    return c.json({ error: "Authentication failed" }, 401);
+// === MIDDLEWARE ===
+async function authMiddleware(context: any, next: () => Promise<unknown>) {
+  const authHeader = context.request.headers.get("authorization");
+  const cookieHeader = context.request.headers.get("cookie");
+  
+  let token: string | null = null;
+  
+  // Try to get token from Authorization header
+  if (authHeader?.startsWith("Bearer ")) {
+    token = authHeader.substring(7);
   }
+  // Try to get token from cookie
+  else if (cookieHeader) {
+    const cookies = cookieHeader.split(';').map(c => c.trim());
+    const tokenCookie = cookies.find(c => c.startsWith('token='));
+    if (tokenCookie) {
+      token = tokenCookie.substring(6);
+    }
+  }
+  
+  if (!token) {
+    console.log("❌ No token found");
+    context.response.status = 401;
+    context.response.body = { error: "Authentication required" };
+    return;
+  }
+  
+  const payload = await verifyJWT(token);
+  if (!payload) {
+    console.log("❌ Invalid token");
+    context.response.status = 401;
+    context.response.body = { error: "Invalid or expired token" };
+    return;
+  }
+  
+  // Verify user still exists
+  const userResult = await client.queryObject(
+    "SELECT id, email FROM users WHERE id = $1",
+    [payload.userId]
+  );
+  
+  if (userResult.rows.length === 0) {
+    console.log("❌ User not found:", payload.userId);
+    context.response.status = 401;
+    context.response.body = { error: "User not found" };
+    return;
+  }
+  
+  // Attach user to context
+  context.state.user = userResult.rows[0];
+  console.log("✅ User authenticated:", payload.email);
+  
+  await next();
 }
 
-// --- Server Initialization ---
+// === ROUTES ===
+const router = new Router();
+
+// Health check
+router.get("/", (context) => {
+  context.response.body = {
+    message: "SimpleDraft API - Oak Framework",
+    version: "1.0",
+    framework: "Oak",
+    timestamp: new Date().toISOString()
+  };
+});
+
+router.get("/health", (context) => {
+  context.response.body = { status: "healthy", framework: "Oak" };
+});
+
+// === AUTH ROUTES ===
+
+// Register
+router.post("/api/auth/register", async (context) => {
+  try {
+    const body = await context.request.body({ type: "json" }).value;
+    const { email, password } = body;
+    
+    console.log("🔵 Register attempt:", email);
+    
+    if (!email || !password) {
+      context.response.status = 400;
+      context.response.body = { error: "Email and password are required" };
+      return;
+    }
+    
+    // Check if user exists
+    const existingUser = await client.queryObject(
+      "SELECT id FROM users WHERE email = $1",
+      [email.toLowerCase()]
+    );
+    
+    if (existingUser.rows.length > 0) {
+      console.log("❌ User already exists:", email);
+      context.response.status = 409;
+      context.response.body = { error: "User already exists" };
+      return;
+    }
+    
+    // Hash password
+    const passwordHash = await SimplePasswordCrypto.hash(password);
+    
+    // Create user
+    const result = await client.queryObject(
+      "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at",
+      [email.toLowerCase(), passwordHash]
+    );
+    
+    const user = result.rows[0] as any;
+    console.log("✅ User created:", user.email);
+    
+    // Create JWT
+    const token = await createJWT(user.id, user.email);
+    
+    // Set cookie
+    context.response.headers.set(
+      "Set-Cookie", 
+      `token=${token}; HttpOnly; Secure; SameSite=None; Max-Age=${7 * 24 * 60 * 60}; Path=/`
+    );
+    
+    context.response.body = {
+      user: { id: user.id, email: user.email, createdAt: user.created_at },
+      message: "Registration successful"
+    };
+    
+  } catch (error) {
+    console.error("❌ Register error:", error);
+    context.response.status = 500;
+    context.response.body = { error: "Registration failed" };
+  }
+});
+
+// Login
+router.post("/api/auth/login", async (context) => {
+  try {
+    const body = await context.request.body({ type: "json" }).value;
+    const { email, password } = body;
+    
+    console.log("🔵 Login attempt:", email);
+    
+    if (!email || !password) {
+      context.response.status = 400;
+      context.response.body = { error: "Email and password are required" };
+      return;
+    }
+    
+    // Find user
+    const result = await client.queryObject(
+      "SELECT id, email, password_hash, created_at FROM users WHERE email = $1",
+      [email.toLowerCase()]
+    );
+    
+    if (result.rows.length === 0) {
+      console.log("❌ User not found:", email);
+      context.response.status = 401;
+      context.response.body = { error: "Invalid credentials" };
+      return;
+    }
+    
+    const user = result.rows[0] as any;
+    
+    // Verify password
+    const validPassword = await SimplePasswordCrypto.verify(password, user.password_hash);
+    
+    if (!validPassword) {
+      console.log("❌ Invalid password for:", email);
+      context.response.status = 401;
+      context.response.body = { error: "Invalid credentials" };
+      return;
+    }
+    
+    // Create JWT
+    const token = await createJWT(user.id, user.email);
+    
+    // Set cookie
+    context.response.headers.set(
+      "Set-Cookie", 
+      `token=${token}; HttpOnly; Secure; SameSite=None; Max-Age=${7 * 24 * 60 * 60}; Path=/`
+    );
+    
+    console.log("✅ User logged in:", user.email);
+    
+    context.response.body = {
+      user: { id: user.id, email: user.email, createdAt: user.created_at },
+      message: "Login successful"
+    };
+    
+  } catch (error) {
+    console.error("❌ Login error:", error);
+    context.response.status = 500;
+    context.response.body = { error: "Login failed" };
+  }
+});
+
+// Logout
+router.post("/api/auth/logout", (context) => {
+  context.response.headers.set(
+    "Set-Cookie", 
+    "token=; HttpOnly; Secure; SameSite=None; Max-Age=0; Path=/"
+  );
+  context.response.body = { message: "Logout successful" };
+});
+
+// === DOCUMENT ROUTES (Protected) ===
+
+// Get all documents
+router.get("/api/documents", authMiddleware, async (context) => {
+  try {
+    const user = context.state.user;
+    console.log("🔵 Fetching documents for user:", user.email);
+    
+    const result = await client.queryObject(
+      `SELECT id, title, content, raw_content, created_at, updated_at 
+       FROM documents 
+       WHERE user_id = $1 
+       ORDER BY updated_at DESC`,
+      [user.id]
+    );
+    
+    const documents = result.rows.map((row: any) => ({
+      id: row.id,
+      title: row.title,
+      content: row.content,
+      rawContent: row.raw_content,
+      createdAt: row.created_at,
+      lastModified: row.updated_at
+    }));
+    
+    console.log(`✅ Found ${documents.length} documents`);
+    
+    context.response.body = { documents };
+    
+  } catch (error) {
+    console.error("❌ Get documents error:", error);
+    context.response.status = 500;
+    context.response.body = { error: "Failed to fetch documents" };
+  }
+});
+
+// Create document
+router.post("/api/documents", authMiddleware, async (context) => {
+  try {
+    const user = context.state.user;
+    const body = await context.request.body({ type: "json" }).value;
+    
+    console.log("🔵 Creating document for user:", user.email);
+    console.log("🔵 Document data:", body);
+    
+    const title = body.title || "Untitled Document";
+    const content = body.content || "";
+    const rawContent = body.rawContent || "";
+    
+    const result = await client.queryObject(
+      `INSERT INTO documents (user_id, title, content, raw_content, updated_at) 
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) 
+       RETURNING id, title, content, raw_content, created_at, updated_at`,
+      [user.id, title, content, rawContent]
+    );
+    
+    const document = result.rows[0] as any;
+    
+    console.log("✅ Document created with ID:", document.id);
+    
+    context.response.status = 201;
+    context.response.body = {
+      document: {
+        id: document.id,
+        title: document.title,
+        content: document.content,
+        rawContent: document.raw_content,
+        createdAt: document.created_at,
+        lastModified: document.updated_at
+      },
+      message: "Document created successfully"
+    };
+    
+  } catch (error) {
+    console.error("❌ Create document error:", error);
+    context.response.status = 500;
+    context.response.body = { error: "Failed to create document" };
+  }
+});
+
+// Update document
+router.put("/api/documents/:id", authMiddleware, async (context) => {
+  try {
+    const user = context.state.user;
+    const documentId = parseInt(context.params.id!);
+    const body = await context.request.body({ type: "json" }).value;
+    
+    console.log(`🔵 Updating document ${documentId} for user:`, user.email);
+    
+    if (isNaN(documentId)) {
+      context.response.status = 400;
+      context.response.body = { error: "Invalid document ID" };
+      return;
+    }
+    
+    const result = await client.queryObject(
+      `UPDATE documents 
+       SET title = $1, content = $2, raw_content = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4 AND user_id = $5
+       RETURNING id, title, content, raw_content, updated_at`,
+      [body.title, body.content, body.rawContent, documentId, user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      context.response.status = 404;
+      context.response.body = { error: "Document not found or access denied" };
+      return;
+    }
+    
+    const document = result.rows[0] as any;
+    
+    console.log("✅ Document updated successfully");
+    
+    context.response.body = {
+      document: {
+        id: document.id,
+        title: document.title,
+        content: document.content,
+        rawContent: document.raw_content,
+        lastModified: document.updated_at
+      },
+      message: "Document updated successfully"
+    };
+    
+  } catch (error) {
+    console.error("❌ Update document error:", error);
+    context.response.status = 500;
+    context.response.body = { error: "Failed to update document" };
+  }
+});
+
+// Delete document
+router.delete("/api/documents/:id", authMiddleware, async (context) => {
+  try {
+    const user = context.state.user;
+    const documentId = parseInt(context.params.id!);
+    
+    console.log(`🔵 Deleting document ${documentId} for user:`, user.email);
+    
+    if (isNaN(documentId)) {
+      context.response.status = 400;
+      context.response.body = { error: "Invalid document ID" };
+      return;
+    }
+    
+    const result = await client.queryObject(
+      "DELETE FROM documents WHERE id = $1 AND user_id = $2 RETURNING id",
+      [documentId, user.id]
+    );
+    
+    if (result.rows.length === 0) {
+      context.response.status = 404;
+      context.response.body = { error: "Document not found or access denied" };
+      return;
+    }
+    
+    console.log("✅ Document deleted successfully");
+    
+    context.response.body = { 
+      message: "Document deleted successfully",
+      deletedId: documentId 
+    };
+    
+  } catch (error) {
+    console.error("❌ Delete document error:", error);
+    context.response.status = 500;
+    context.response.body = { error: "Failed to delete document" };
+  }
+});
+
+// === APPLICATION SETUP ===
+const app = new Application();
+
+// Global error handler
+app.addEventListener("error", (evt) => {
+  console.error("❌ Application error:", evt.error);
+});
+
+// CORS middleware
+app.use(oakCors({
+  origin: [FRONTEND_URL, "http://127.0.0.1:5500", "http://localhost:3000"],
+  credentials: true,
+  allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowHeaders: ["Content-Type", "Authorization"]
+}));
+
+// Request logging
+app.use(async (context, next) => {
+  const start = Date.now();
+  await next();
+  const ms = Date.now() - start;
+  console.log(`${context.request.method} ${context.request.url.pathname} - ${context.response.status} - ${ms}ms`);
+});
+
+// Routes
+app.use(router.routes());
+app.use(router.allowedMethods());
+
+// === START SERVER ===
 async function startServer() {
   try {
-    await client.connect();
-    console.log("✅ Connected to PostgreSQL database");
+    await initDatabase();
     
-    await initializeDatabase();
-    
-    const app = new Hono();
-
-    // CORS Configuration
-    app.use('*', cors({
-      origin: [FRONTEND_URL, 'http://127.0.0.1:5500', 'http://localhost:3000'],
-      credentials: true,
-      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-      allowHeaders: ['Content-Type', 'Authorization']
-    }));
-
-    // Health Check
-    app.get('/health', (c) => c.json({ 
-      status: 'healthy', 
-      timestamp: new Date().toISOString(),
-      version: '4.2',
-      crypto: 'Web Crypto API'
-    }));
-
-    app.get('/', (c) => c.json({ 
-      message: 'SimpleDraft API v4.2 - Fixed Document Creation',
-      endpoints: {
-        auth: ['/api/auth/register', '/api/auth/login', '/api/auth/logout'],
-        documents: ['/api/documents (GET/POST)', '/api/documents/:id (PUT/DELETE)']
-      }
-    }));
-
-    // === AUTHENTICATION ROUTES ===
-
-    // User Registration
-    app.post('/api/auth/register', async (c) => {
-      try {
-        const body = await c.req.json();
-        console.log("📝 Registration attempt for:", body.email);
-        
-        const { email, password } = authSchema.parse(body);
-
-        const existingResult = await client.queryObject<{ id: number }>(
-          "SELECT id FROM users WHERE email = $1",
-          [email.toLowerCase()]
-        );
-
-        if (existingResult.rows.length > 0) {
-          console.log("❌ User already exists:", email);
-          return c.json({ error: "User with this email already exists" }, 409);
-        }
-
-        console.log("🔐 Hashing password...");
-        const passwordHash = await PasswordCrypto.hash(password);
-        
-        console.log("👤 Creating user in database...");
-        const insertResult = await client.queryObject<{ id: number; email: string; created_at: string }>(
-          "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at",
-          [email.toLowerCase(), passwordHash]
-        );
-
-        const user = insertResult.rows[0];
-        console.log("✅ User created with ID:", user.id);
-        
-        const token = await generateJWT(user.id);
-        c.header("Set-Cookie", setCookieHeader(token));
-
-        return c.json({
-          user: {
-            id: user.id,
-            email: user.email,
-            createdAt: user.created_at
-          },
-          message: "Registration successful"
-        });
-
-      } catch (error) {
-        if (error instanceof z.ZodError) {
-          console.log("❌ Validation error:", error.errors);
-          return c.json({ 
-            error: "Invalid input data", 
-            details: error.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
-          }, 400);
-        }
-        
-        console.error("❌ Registration error:", error);
-        return c.json({ 
-          error: "Registration failed", 
-          details: error.message 
-        }, 500);
-      }
-    });
-
-    // User Login
-    app.post('/api/auth/login', async (c) => {
-      try {
-        const body = await c.req.json();
-        console.log("🔐 Login attempt for:", body.email);
-        
-        const { email, password } = authSchema.parse(body);
-
-        console.log("👤 Finding user in database...");
-        const userResult = await client.queryObject<{ 
-          id: number; 
-          email: string; 
-          password_hash: string; 
-          created_at: string;
-        }>(
-          "SELECT id, email, password_hash, created_at FROM users WHERE email = $1",
-          [email.toLowerCase()]
-        );
-
-        if (userResult.rows.length === 0) {
-          console.log("❌ User not found:", email);
-          return c.json({ error: "Invalid email or password" }, 401);
-        }
-
-        const user = userResult.rows[0];
-        console.log("✅ User found with ID:", user.id);
-
-        console.log("🔐 Verifying password...");
-        const passwordValid = await PasswordCrypto.verify(password, user.password_hash);
-        
-        if (!passwordValid) {
-          console.log("❌ Invalid password for:", email);
-          return c.json({ error: "Invalid email or password" }, 401);
-        }
-
-        console.log("✅ Password verified successfully");
-
-        const token = await generateJWT(user.id);
-        c.header("Set-Cookie", setCookieHeader(token));
-
-        return c.json({
-          user: {
-            id: user.id,
-            email: user.email,
-            createdAt: user.created_at
-          },
-          message: "Login successful"
-        });
-
-      } catch (error) {
-        if (error instanceof z.ZodError) {
-          console.log("❌ Validation error:", error.errors);
-          return c.json({ 
-            error: "Invalid input data", 
-            details: error.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
-          }, 400);
-        }
-        
-        console.error("❌ Login error:", error);
-        return c.json({ 
-          error: "Login failed", 
-          details: error.message 
-        }, 500);
-      }
-    });
-
-    // User Logout
-    app.post('/api/auth/logout', (c) => {
-      c.header("Set-Cookie", clearCookieHeader());
-      return c.json({ message: "Logout successful" });
-    });
-
-    // === DOCUMENT ROUTES ===
-
-    // Get all documents for authenticated user
-    app.get('/api/documents', authMiddleware, async (c) => {
-      try {
-        const user = c.get("user");
-        console.log("📄 Fetching documents for user:", user.email);
-        
-        const result = await client.queryObject<{
-          id: number;
-          title: string;
-          content: string;
-          raw_content: string;
-          lastModified: string;
-          created_at: string;
-        }>(
-          `SELECT id, title, content, raw_content, "lastModified", created_at 
-           FROM documents 
-           WHERE user_id = $1 
-           ORDER BY "lastModified" DESC`,
-          [user.id]
-        );
-
-        console.log(`✅ Found ${result.rows.length} documents for user ${user.email}`);
-
-        return c.json({ 
-          documents: result.rows.map(doc => ({
-            id: doc.id,
-            title: doc.title,
-            content: doc.content,
-            rawContent: doc.raw_content,
-            lastModified: doc.lastModified,
-            createdAt: doc.created_at
-          }))
-        });
-
-      } catch (error) {
-        console.error("❌ Get documents error:", error);
-        return c.json({ 
-          error: "Failed to fetch documents",
-          details: error.message 
-        }, 500);
-      }
-    });
-
-    // Create new document - اصلاح شده
-    app.post('/api/documents', authMiddleware, async (c) => {
-      try {
-        const user = c.get("user");
-        console.log("📝 Creating new document for user:", user.email);
-        
-        // دریافت body و validation
-        let body;
-        try {
-          body = await c.req.json();
-          console.log("📄 Document data received:", body);
-        } catch (error) {
-          console.error("❌ JSON parsing error:", error);
-          return c.json({ error: "Invalid JSON format" }, 400);
-        }
-
-        // Parse و validate کردن data
-        const validatedData = documentSchema.parse(body);
-        console.log("✅ Document data validated:", validatedData);
-        
-        const { title, content, rawContent } = validatedData;
-
-        // Insert در database
-        const result = await client.queryObject<{
-          id: number;
-          title: string;
-          content: string;
-          raw_content: string;
-          lastModified: string;
-          created_at: string;
-        }>(
-          `INSERT INTO documents (user_id, title, content, raw_content, "lastModified") 
-           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) 
-           RETURNING id, title, content, raw_content, "lastModified", created_at`,
-          [user.id, title, content || "", rawContent || ""]
-        );
-
-        if (result.rows.length === 0) {
-          throw new Error("Document creation failed - no rows returned");
-        }
-
-        const document = result.rows[0];
-        console.log("✅ Document created successfully with ID:", document.id);
-
-        return c.json({
-          document: {
-            id: document.id,
-            title: document.title,
-            content: document.content,
-            rawContent: document.raw_content,
-            lastModified: document.lastModified,
-            createdAt: document.created_at
-          },
-          message: "Document created successfully"
-        }, 201);
-
-      } catch (error) {
-        if (error instanceof z.ZodError) {
-          console.error("❌ Validation error:", error.errors);
-          return c.json({ 
-            error: "Invalid document data", 
-            details: error.errors.map(e => ({ 
-              field: e.path.join('.'), 
-              message: e.message 
-            }))
-          }, 400);
-        }
-        
-        console.error("❌ Create document error:", error);
-        return c.json({ 
-          error: "Failed to create document",
-          details: error.message 
-        }, 500);
-      }
-    });
-
-    // Update document
-    app.put('/api/documents/:id', authMiddleware, async (c) => {
-      try {
-        const user = c.get("user");
-        const documentId = parseInt(c.req.param('id'));
-        
-        if (isNaN(documentId)) {
-          return c.json({ error: "Invalid document ID" }, 400);
-        }
-
-        console.log(`📝 Updating document ${documentId} for user:`, user.email);
-
-        const body = await c.req.json();
-        const validatedData = documentUpdateSchema.parse(body);
-        const { title, content, rawContent } = validatedData;
-
-        // Verify document ownership
-        const ownershipResult = await client.queryObject<{ id: number }>(
-          "SELECT id FROM documents WHERE id = $1 AND user_id = $2",
-          [documentId, user.id]
-        );
-
-        if (ownershipResult.rows.length === 0) {
-          console.log(`❌ Document ${documentId} not found or access denied for user:`, user.email);
-          return c.json({ error: "Document not found or access denied" }, 404);
-        }
-
-        // Update document
-        const result = await client.queryObject<{
-          id: number;
-          title: string;
-          content: string;
-          raw_content: string;
-          lastModified: string;
-        }>(
-          `UPDATE documents 
-           SET title = $1, content = $2, raw_content = $3, "lastModified" = CURRENT_TIMESTAMP
-           WHERE id = $4 AND user_id = $5
-           RETURNING id, title, content, raw_content, "lastModified"`,
-          [title, content || "", rawContent || "", documentId, user.id]
-        );
-
-        const document = result.rows[0];
-        console.log(`✅ Document ${documentId} updated successfully`);
-
-        return c.json({
-          document: {
-            id: document.id,
-            title: document.title,
-            content: document.content,
-            rawContent: document.raw_content,
-            lastModified: document.lastModified
-          },
-          message: "Document updated successfully"
-        });
-
-      } catch (error) {
-        if (error instanceof z.ZodError) {
-          return c.json({ 
-            error: "Invalid document data", 
-            details: error.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
-          }, 400);
-        }
-        
-        console.error("❌ Update document error:", error);
-        return c.json({ 
-          error: "Failed to update document",
-          details: error.message 
-        }, 500);
-      }
-    });
-
-    // Delete document
-    app.delete('/api/documents/:id', authMiddleware, async (c) => {
-      try {
-        const user = c.get("user");
-        const documentId = parseInt(c.req.param('id'));
-        
-        if (isNaN(documentId)) {
-          return c.json({ error: "Invalid document ID" }, 400);
-        }
-
-        console.log(`🗑️ Deleting document ${documentId} for user:`, user.email);
-
-        // Verify document ownership and delete
-        const result = await client.queryObject<{ id: number }>(
-          "DELETE FROM documents WHERE id = $1 AND user_id = $2 RETURNING id",
-          [documentId, user.id]
-        );
-
-        if (result.rows.length === 0) {
-          console.log(`❌ Document ${documentId} not found or access denied for user:`, user.email);
-          return c.json({ error: "Document not found or access denied" }, 404);
-        }
-
-        console.log(`✅ Document ${documentId} deleted successfully`);
-
-        return c.json({ 
-          message: "Document deleted successfully",
-          deletedId: documentId 
-        });
-
-      } catch (error) {
-        console.error("❌ Delete document error:", error);
-        return c.json({ 
-          error: "Failed to delete document",
-          details: error.message 
-        }, 500);
-      }
-    });
-
-    // === ERROR HANDLING ===
-    app.notFound((c) => {
-      return c.json({ error: "Endpoint not found" }, 404);
-    });
-
-    app.onError((err, c) => {
-      console.error("Global error handler:", err);
-      return c.json({ 
-        error: "Internal server error",
-        details: err.message 
-      }, 500);
-    });
-
-    // === SERVER STARTUP ===
-    console.log(`🚀 SimpleDraft API v4.2 starting on port ${PORT}`);
+    console.log(`🚀 SimpleDraft API (Oak Framework) starting...`);
     console.log(`📄 Frontend: ${FRONTEND_URL}`);
-    console.log(`🔐 Authentication: Web Crypto API (PBKDF2)`);
+    console.log(`🔐 JWT Authentication: ✅ Enabled`);
     console.log(`💾 Database: ✅ Connected`);
-
-    Deno.serve({ port: PORT }, app.fetch);
+    console.log(`🌐 Port: ${PORT}`);
+    
+    await app.listen({ port: PORT });
     
   } catch (error) {
     console.error("❌ Server startup failed:", error);
@@ -660,8 +574,8 @@ async function startServer() {
   }
 }
 
-// === GRACEFUL SHUTDOWN ===
-async function gracefulShutdown() {
+// Graceful shutdown
+const gracefulShutdown = async () => {
   console.log("\n⏳ Gracefully shutting down...");
   try {
     await client.end();
@@ -670,16 +584,12 @@ async function gracefulShutdown() {
     console.error("❌ Error during shutdown:", error);
   }
   Deno.exit(0);
-}
+};
 
-// Handle shutdown signals
 Deno.addSignalListener("SIGINT", gracefulShutdown);
 Deno.addSignalListener("SIGTERM", gracefulShutdown);
 
-// === APPLICATION ENTRY POINT ===
+// === START APPLICATION ===
 if (import.meta.main) {
-  startServer().catch((error) => {
-    console.error("💥 Fatal error:", error);
-    Deno.exit(1);
-  });
+  startServer();
 }
