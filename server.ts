@@ -1,5 +1,5 @@
 // ====================================================
-// SimpleDraft Backend Server (v3.1 - Deno Deploy Final)
+// SimpleDraft Backend Server (v3.2 - Syntax Fix)
 // ====================================================
 
 import { Hono } from "hono";
@@ -16,8 +16,6 @@ const FRONTEND_URL = Deno.env.get("FRONTEND_URL") || "https://simpledraft.cyruss
 
 // بررسی وجود متغیرهای حیاتی
 if (!JWT_SECRET || !DATABASE_URL) {
-  // به جای Deno.exit، یک خطای واضح ایجاد می‌کنیم.
-  // Deno Deploy این خطا را لاگ کرده و اجرای برنامه را متوقف می‌کند.
   throw new Error("FATAL: JWT_SECRET or DATABASE_URL environment variables are not set in Deno Deploy dashboard.");
 }
 
@@ -56,18 +54,36 @@ async function startServer() {
     await initializeSchema();
   } catch (err) {
     console.error("❌ Database connection or schema initialization failed:", err);
-    // به جای Deno.exit، یک خطا throw می‌کنیم تا Deno Deploy آن را مدیریت کند.
     throw new Error("Database initialization failed. Check connection string and database status.");
   }
 
-  // --- راه‌اندازی اپلیکیشن Hono ---
   const app = new Hono();
 
-  // --- Middlewares ---
   app.use('*', cors({
       origin: [FRONTEND_URL, 'http://127.0.0.1:5500'],
       credentials: true
   }));
+
+  const jwtMiddleware = jwt({ secret: JWT_SECRET, cookie: 'token' });
+
+  async function createToken(userId: number, secret: string): Promise<string> {
+    const payload = { id: userId, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7 };
+    return await sign(payload, secret);
+  }
+
+  app.get('/health', (c) => c.json({ status: 'ok' }));
+  app.get('/', (c) => c.json({ status: 'ok', message: 'SimpleDraft API is running on Deno Deploy!' }));
+
+  const authSchema = z.object({
+      email: z.string().email("ایمیل وارد شده معتبر نیست."),
+      password: z.string().min(6, "رمز عبور باید حداقل ۶ کاراکتر باشد.")
+  }); // <-- کامای اضافی از اینجا حذف شد
+
+  app.post('/api/auth/register', async (c) => {
+      try {
+          const body = await c.req.json();
+          const { email, password } = authSchema.parse(body);
+          const existingResult = await client.queryObject<{ id: number }>("SELECT id FROM users WHERE email = $1", [email]);
           if (existingResult.rows.length > 0) {
               return c.json({ error: 'کاربری با این ایمیل قبلاً ثبت‌نام کرده است.' }, 409);
           }
@@ -84,7 +100,6 @@ async function startServer() {
       }
   });
 
-  // --- روت‌های اسناد ---
   app.get('/api/documents', jwtMiddleware, async (c) => {
       const payload = c.get('jwtPayload');
       const result = await client.queryObject(
@@ -93,16 +108,11 @@ async function startServer() {
       );
       return c.json({ documents: result.rows });
   });
-  
-  // ... (تمام روت‌های دیگر شما در اینجا قرار می‌گیرند) ...
 
-
-  // --- شروع به کار سرور ---
   Deno.serve(app.fetch);
   console.log("Server is ready and listening.");
 }
 
-// اجرای تابع اصلی برنامه
 startServer().catch(err => {
   console.error("Application failed to start:", err.message);
 });
