@@ -1,6 +1,6 @@
 // ====================================================
-// SimpleDraft Backend Server (v4.1 - Fixed Authentication)
-// Production-ready Deno 2.x server with Web Crypto API
+// SimpleDraft Backend Server (v4.2 - Fixed Document Creation)
+// Production-ready Deno 2.x server with fixed CRUD operations
 // ====================================================
 
 import { Hono } from "hono";
@@ -30,18 +30,11 @@ class PasswordCrypto {
   private static readonly KEY_LENGTH = 64;
   private static readonly SALT_LENGTH = 16;
 
-  /**
-   * Hash password using PBKDF2 with Web Crypto API
-   */
   static async hash(password: string): Promise<string> {
     try {
-      // Generate random salt
       const salt = crypto.getRandomValues(new Uint8Array(this.SALT_LENGTH));
-      
-      // Convert password to buffer
       const passwordBuffer = new TextEncoder().encode(password);
       
-      // Import password as key material
       const keyMaterial = await crypto.subtle.importKey(
         "raw",
         passwordBuffer,
@@ -50,7 +43,6 @@ class PasswordCrypto {
         ["deriveBits"]
       );
       
-      // Derive key using PBKDF2
       const derivedKey = await crypto.subtle.deriveBits(
         {
           name: "PBKDF2",
@@ -62,12 +54,10 @@ class PasswordCrypto {
         this.KEY_LENGTH * 8
       );
       
-      // Combine salt and derived key
       const hashArray = new Uint8Array(this.SALT_LENGTH + this.KEY_LENGTH);
       hashArray.set(salt, 0);
       hashArray.set(new Uint8Array(derivedKey), this.SALT_LENGTH);
       
-      // Convert to base64
       return btoa(String.fromCharCode(...hashArray));
     } catch (error) {
       console.error("Password hashing failed:", error);
@@ -75,24 +65,16 @@ class PasswordCrypto {
     }
   }
 
-  /**
-   * Verify password against stored hash
-   */
   static async verify(password: string, storedHash: string): Promise<boolean> {
     try {
-      // Decode the stored hash
       const hashArray = new Uint8Array(
         atob(storedHash).split('').map(char => char.charCodeAt(0))
       );
       
-      // Extract salt and stored key
       const salt = hashArray.slice(0, this.SALT_LENGTH);
       const storedKey = hashArray.slice(this.SALT_LENGTH);
-      
-      // Convert password to buffer
       const passwordBuffer = new TextEncoder().encode(password);
       
-      // Import password as key material
       const keyMaterial = await crypto.subtle.importKey(
         "raw",
         passwordBuffer,
@@ -101,7 +83,6 @@ class PasswordCrypto {
         ["deriveBits"]
       );
       
-      // Derive key with same parameters
       const derivedKey = await crypto.subtle.deriveBits(
         {
           name: "PBKDF2",
@@ -113,7 +94,6 @@ class PasswordCrypto {
         this.KEY_LENGTH * 8
       );
       
-      // Compare keys using constant-time comparison
       const derivedKeyArray = new Uint8Array(derivedKey);
       
       if (derivedKeyArray.length !== storedKey.length) {
@@ -139,16 +119,17 @@ const authSchema = z.object({
   password: z.string().min(6, "Password must be at least 6 characters").max(128)
 });
 
+// اصلاح schema برای documents
 const documentSchema = z.object({
-  title: z.string().min(1, "Title is required").max(255),
-  content: z.string().default(""),
-  rawContent: z.string().default("")
+  title: z.string().min(1, "Title is required").max(255).default("Untitled Document"),
+  content: z.string().optional().default(""),
+  rawContent: z.string().optional().default("")
 });
 
 const documentUpdateSchema = z.object({
   title: z.string().min(1, "Title is required").max(255),
-  content: z.string(),
-  rawContent: z.string()
+  content: z.string().optional().default(""),
+  rawContent: z.string().optional().default("")
 });
 
 // --- Database Schema Initialization ---
@@ -196,7 +177,7 @@ async function initializeDatabase() {
 async function generateJWT(userId: number): Promise<string> {
   const payload = {
     id: userId,
-    exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7) // 7 days
+    exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7)
   };
   return await sign(payload, JWT_SECRET!);
 }
@@ -224,28 +205,31 @@ async function authMiddleware(c: any, next: () => Promise<void>) {
     const token = c.req.header("cookie")?.match(/token=([^;]+)/)?.[1];
     
     if (!token) {
+      console.log("❌ No token found in cookies");
       return c.json({ error: "Authentication required" }, 401);
     }
 
     const payload = await verifyJWT(token);
     if (!payload) {
+      console.log("❌ Invalid JWT token");
       return c.json({ error: "Invalid or expired token" }, 401);
     }
 
-    // Verify user still exists
     const userResult = await client.queryObject<{ id: number; email: string }>(
       "SELECT id, email FROM users WHERE id = $1",
       [payload.id]
     );
 
     if (userResult.rows.length === 0) {
+      console.log("❌ User not found for ID:", payload.id);
       return c.json({ error: "User not found" }, 401);
     }
 
+    console.log("✅ User authenticated:", userResult.rows[0].email);
     c.set("user", userResult.rows[0]);
     await next();
   } catch (error) {
-    console.error("Auth middleware error:", error);
+    console.error("❌ Auth middleware error:", error);
     return c.json({ error: "Authentication failed" }, 401);
   }
 }
@@ -272,17 +256,16 @@ async function startServer() {
     app.get('/health', (c) => c.json({ 
       status: 'healthy', 
       timestamp: new Date().toISOString(),
-      version: '4.1',
+      version: '4.2',
       crypto: 'Web Crypto API'
     }));
 
     app.get('/', (c) => c.json({ 
-      message: 'SimpleDraft API v4.1 - Web Crypto Authentication',
+      message: 'SimpleDraft API v4.2 - Fixed Document Creation',
       endpoints: {
         auth: ['/api/auth/register', '/api/auth/login', '/api/auth/logout'],
         documents: ['/api/documents (GET/POST)', '/api/documents/:id (PUT/DELETE)']
-      },
-      security: 'PBKDF2 with SHA-256'
+      }
     }));
 
     // === AUTHENTICATION ROUTES ===
@@ -295,7 +278,6 @@ async function startServer() {
         
         const { email, password } = authSchema.parse(body);
 
-        // Check if user already exists
         const existingResult = await client.queryObject<{ id: number }>(
           "SELECT id FROM users WHERE email = $1",
           [email.toLowerCase()]
@@ -306,11 +288,9 @@ async function startServer() {
           return c.json({ error: "User with this email already exists" }, 409);
         }
 
-        // Hash password using Web Crypto API
         console.log("🔐 Hashing password...");
         const passwordHash = await PasswordCrypto.hash(password);
         
-        // Create user
         console.log("👤 Creating user in database...");
         const insertResult = await client.queryObject<{ id: number; email: string; created_at: string }>(
           "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email, created_at",
@@ -320,10 +300,7 @@ async function startServer() {
         const user = insertResult.rows[0];
         console.log("✅ User created with ID:", user.id);
         
-        // Generate JWT
         const token = await generateJWT(user.id);
-
-        // Set HTTP-only cookie
         c.header("Set-Cookie", setCookieHeader(token));
 
         return c.json({
@@ -360,7 +337,6 @@ async function startServer() {
         
         const { email, password } = authSchema.parse(body);
 
-        // Find user by email
         console.log("👤 Finding user in database...");
         const userResult = await client.queryObject<{ 
           id: number; 
@@ -380,7 +356,6 @@ async function startServer() {
         const user = userResult.rows[0];
         console.log("✅ User found with ID:", user.id);
 
-        // Verify password using Web Crypto API
         console.log("🔐 Verifying password...");
         const passwordValid = await PasswordCrypto.verify(password, user.password_hash);
         
@@ -391,7 +366,6 @@ async function startServer() {
 
         console.log("✅ Password verified successfully");
 
-        // Generate JWT and set cookie
         const token = await generateJWT(user.id);
         c.header("Set-Cookie", setCookieHeader(token));
 
@@ -433,6 +407,7 @@ async function startServer() {
     app.get('/api/documents', authMiddleware, async (c) => {
       try {
         const user = c.get("user");
+        console.log("📄 Fetching documents for user:", user.email);
         
         const result = await client.queryObject<{
           id: number;
@@ -442,12 +417,14 @@ async function startServer() {
           lastModified: string;
           created_at: string;
         }>(
-          `SELECT id, title, content, raw_content as "rawContent", "lastModified", created_at 
+          `SELECT id, title, content, raw_content, "lastModified", created_at 
            FROM documents 
            WHERE user_id = $1 
            ORDER BY "lastModified" DESC`,
           [user.id]
         );
+
+        console.log(`✅ Found ${result.rows.length} documents for user ${user.email}`);
 
         return c.json({ 
           documents: result.rows.map(doc => ({
@@ -461,18 +438,37 @@ async function startServer() {
         });
 
       } catch (error) {
-        console.error("Get documents error:", error);
-        return c.json({ error: "Failed to fetch documents" }, 500);
+        console.error("❌ Get documents error:", error);
+        return c.json({ 
+          error: "Failed to fetch documents",
+          details: error.message 
+        }, 500);
       }
     });
 
-    // Create new document
+    // Create new document - اصلاح شده
     app.post('/api/documents', authMiddleware, async (c) => {
       try {
         const user = c.get("user");
-        const body = await c.req.json();
-        const { title, content, rawContent } = documentSchema.parse(body);
+        console.log("📝 Creating new document for user:", user.email);
+        
+        // دریافت body و validation
+        let body;
+        try {
+          body = await c.req.json();
+          console.log("📄 Document data received:", body);
+        } catch (error) {
+          console.error("❌ JSON parsing error:", error);
+          return c.json({ error: "Invalid JSON format" }, 400);
+        }
 
+        // Parse و validate کردن data
+        const validatedData = documentSchema.parse(body);
+        console.log("✅ Document data validated:", validatedData);
+        
+        const { title, content, rawContent } = validatedData;
+
+        // Insert در database
         const result = await client.queryObject<{
           id: number;
           title: string;
@@ -483,11 +479,16 @@ async function startServer() {
         }>(
           `INSERT INTO documents (user_id, title, content, raw_content, "lastModified") 
            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) 
-           RETURNING id, title, content, raw_content as "rawContent", "lastModified", created_at`,
-          [user.id, title, content, rawContent]
+           RETURNING id, title, content, raw_content, "lastModified", created_at`,
+          [user.id, title, content || "", rawContent || ""]
         );
 
+        if (result.rows.length === 0) {
+          throw new Error("Document creation failed - no rows returned");
+        }
+
         const document = result.rows[0];
+        console.log("✅ Document created successfully with ID:", document.id);
 
         return c.json({
           document: {
@@ -503,14 +504,21 @@ async function startServer() {
 
       } catch (error) {
         if (error instanceof z.ZodError) {
+          console.error("❌ Validation error:", error.errors);
           return c.json({ 
             error: "Invalid document data", 
-            details: error.errors.map(e => ({ field: e.path.join('.'), message: e.message }))
+            details: error.errors.map(e => ({ 
+              field: e.path.join('.'), 
+              message: e.message 
+            }))
           }, 400);
         }
         
-        console.error("Create document error:", error);
-        return c.json({ error: "Failed to create document" }, 500);
+        console.error("❌ Create document error:", error);
+        return c.json({ 
+          error: "Failed to create document",
+          details: error.message 
+        }, 500);
       }
     });
 
@@ -524,8 +532,11 @@ async function startServer() {
           return c.json({ error: "Invalid document ID" }, 400);
         }
 
+        console.log(`📝 Updating document ${documentId} for user:`, user.email);
+
         const body = await c.req.json();
-        const { title, content, rawContent } = documentUpdateSchema.parse(body);
+        const validatedData = documentUpdateSchema.parse(body);
+        const { title, content, rawContent } = validatedData;
 
         // Verify document ownership
         const ownershipResult = await client.queryObject<{ id: number }>(
@@ -534,6 +545,7 @@ async function startServer() {
         );
 
         if (ownershipResult.rows.length === 0) {
+          console.log(`❌ Document ${documentId} not found or access denied for user:`, user.email);
           return c.json({ error: "Document not found or access denied" }, 404);
         }
 
@@ -548,11 +560,12 @@ async function startServer() {
           `UPDATE documents 
            SET title = $1, content = $2, raw_content = $3, "lastModified" = CURRENT_TIMESTAMP
            WHERE id = $4 AND user_id = $5
-           RETURNING id, title, content, raw_content as "rawContent", "lastModified"`,
-          [title, content, rawContent, documentId, user.id]
+           RETURNING id, title, content, raw_content, "lastModified"`,
+          [title, content || "", rawContent || "", documentId, user.id]
         );
 
         const document = result.rows[0];
+        console.log(`✅ Document ${documentId} updated successfully`);
 
         return c.json({
           document: {
@@ -573,8 +586,11 @@ async function startServer() {
           }, 400);
         }
         
-        console.error("Update document error:", error);
-        return c.json({ error: "Failed to update document" }, 500);
+        console.error("❌ Update document error:", error);
+        return c.json({ 
+          error: "Failed to update document",
+          details: error.message 
+        }, 500);
       }
     });
 
@@ -588,6 +604,8 @@ async function startServer() {
           return c.json({ error: "Invalid document ID" }, 400);
         }
 
+        console.log(`🗑️ Deleting document ${documentId} for user:`, user.email);
+
         // Verify document ownership and delete
         const result = await client.queryObject<{ id: number }>(
           "DELETE FROM documents WHERE id = $1 AND user_id = $2 RETURNING id",
@@ -595,8 +613,11 @@ async function startServer() {
         );
 
         if (result.rows.length === 0) {
+          console.log(`❌ Document ${documentId} not found or access denied for user:`, user.email);
           return c.json({ error: "Document not found or access denied" }, 404);
         }
+
+        console.log(`✅ Document ${documentId} deleted successfully`);
 
         return c.json({ 
           message: "Document deleted successfully",
@@ -604,8 +625,11 @@ async function startServer() {
         });
 
       } catch (error) {
-        console.error("Delete document error:", error);
-        return c.json({ error: "Failed to delete document" }, 500);
+        console.error("❌ Delete document error:", error);
+        return c.json({ 
+          error: "Failed to delete document",
+          details: error.message 
+        }, 500);
       }
     });
 
@@ -616,14 +640,17 @@ async function startServer() {
 
     app.onError((err, c) => {
       console.error("Global error handler:", err);
-      return c.json({ error: "Internal server error" }, 500);
+      return c.json({ 
+        error: "Internal server error",
+        details: err.message 
+      }, 500);
     });
 
     // === SERVER STARTUP ===
-    console.log(`🚀 SimpleDraft API v4.1 starting on port ${PORT}`);
-    console.log(`📄 Swagger/docs available at: ${FRONTEND_URL}`);
+    console.log(`🚀 SimpleDraft API v4.2 starting on port ${PORT}`);
+    console.log(`📄 Frontend: ${FRONTEND_URL}`);
     console.log(`🔐 Authentication: Web Crypto API (PBKDF2)`);
-    console.log(`💾 Database: ${DATABASE_URL ? '✅ Connected' : '❌ Not connected'}`);
+    console.log(`💾 Database: ✅ Connected`);
 
     Deno.serve({ port: PORT }, app.fetch);
     
