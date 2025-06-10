@@ -116,3 +116,5 @@ async function startServer() {
 startServer().catch(err => {
   console.error("Application failed to start:", err.message);
 });
+// --- پایان کد ---
+// این کد یک سرور ساده با استفاده از Hono و PostgreSQL ایجاد می‌کند که امکان ثبت‌نام، ورود و مدیریت اسناد را فراهم می‌کند.
